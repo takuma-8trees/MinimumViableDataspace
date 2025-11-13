@@ -1,0 +1,439 @@
+version: '3.8'
+
+services:
+  # PostgreSQL databases
+  postgres-consumer:
+    image: postgres:16-alpine
+    container_name: mvd-postgres-consumer
+    environment:
+      POSTGRES_DB: consumer
+      POSTGRES_USER: consumer
+      POSTGRES_PASSWORD: consumer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-consumer-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U consumer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-provider:
+    image: postgres:16-alpine
+    container_name: mvd-postgres-provider
+    environment:
+      POSTGRES_DB: provider
+      POSTGRES_USER: provider
+      POSTGRES_PASSWORD: provider
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-provider-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U provider"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-issuer:
+    image: postgres:16-alpine
+    container_name: mvd-postgres-issuer
+    environment:
+      POSTGRES_DB: issuer
+      POSTGRES_USER: issuer
+      POSTGRES_PASSWORD: issuer
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-issuer-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U issuer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # HashiCorp Vault
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: mvd-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # NGINX for issuer DID document
+  nginx-issuer:
+    image: nginx:alpine
+    container_name: mvd-nginx-issuer
+    ports:
+      - "9876:80"
+    volumes:
+      - ./deployment/assets/issuer/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deployment/assets/issuer/did.docker.json:/var/www/.well-known/did.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/.well-known/did.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Issuer Service
+  issuer-service:
+    build:
+      context: .
+      dockerfile: launchers/issuerservice/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/issuerservice/build/libs/issuerservice.jar
+    container_name: mvd-issuer-service
+    ports:
+      - "8091:8091"
+    environment:
+      WEB_HTTP_PORT: "8091"
+      WEB_HTTP_PATH: "/api"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-issuer:5432/issuer"
+      EDC_DATASOURCE_DEFAULT_USER: "issuer"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "issuer"
+    depends_on:
+      postgres-issuer:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      nginx-issuer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Consumer Identity Hub
+  consumer-identityhub:
+    build:
+      context: .
+      dockerfile: launchers/identity-hub/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/identity-hub/build/libs/identity-hub.jar
+    container_name: mvd-consumer-identityhub
+    ports:
+      - "7083:7083"
+      - "7086:7086"
+    environment:
+      WEB_HTTP_PORT: "7083"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_IDENTITY_PORT: "7083"
+      WEB_HTTP_IDENTITY_PATH: "/api/identity"
+      WEB_HTTP_RESOLUTION_PORT: "7083"
+      WEB_HTTP_RESOLUTION_PATH: "/api/resolution"
+      WEB_HTTP_STS_PORT: "7086"
+      WEB_HTTP_STS_PATH: "/api/sts"
+      EDC_PARTICIPANT_ID: "did:web:consumer-identityhub:7083"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-consumer:5432/consumer"
+      EDC_DATASOURCE_DEFAULT_USER: "consumer"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "consumer"
+    depends_on:
+      postgres-consumer:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      issuer-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7083/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Consumer Connector (Control Plane + Data Plane)
+  consumer-connector:
+    build:
+      context: .
+      dockerfile: launchers/controlplane/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/controlplane/build/libs/controlplane.jar
+    container_name: mvd-consumer-connector
+    ports:
+      - "8080:8080"  # Default API
+      - "8081:8081"  # Management API
+      - "8082:8082"  # DSP Protocol API
+      - "8083:8083"  # Control API
+      - "8084:8084"  # Catalog API
+      - "8085:8085"  # Version API
+      - "11001:11001"  # Data Plane Public API
+    environment:
+      WEB_HTTP_PORT: "8080"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_MANAGEMENT_PORT: "8081"
+      WEB_HTTP_MANAGEMENT_PATH: "/api/management/"
+      WEB_HTTP_MANAGEMENT_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_MANAGEMENT_AUTH_KEY: "password"
+      WEB_HTTP_PROTOCOL_PORT: "8082"
+      WEB_HTTP_PROTOCOL_PATH: "/api/dsp"
+      WEB_HTTP_CONTROL_PORT: "8083"
+      WEB_HTTP_CONTROL_PATH: "/api/control"
+      WEB_HTTP_CATALOG_PORT: "8084"
+      WEB_HTTP_CATALOG_PATH: "/api/catalog"
+      WEB_HTTP_CATALOG_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_CATALOG_AUTH_KEY: "password"
+      WEB_HTTP_VERSION_PORT: "8085"
+      WEB_HTTP_VERSION_PATH: "/api/version"
+      WEB_HTTP_PUBLIC_PORT: "11001"
+      WEB_HTTP_PUBLIC_PATH: "/api/public"
+      EDC_PARTICIPANT_ID: "did:web:consumer-identityhub:7083"
+      EDC_IAM_ISSUER_ID: "did:web:consumer-identityhub:7083"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_DSP_CALLBACK_ADDRESS: "http://consumer-connector:8082/api/dsp"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-consumer:5432/consumer"
+      EDC_DATASOURCE_DEFAULT_USER: "consumer"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "consumer"
+      EDC_IAM_STS_OAUTH_TOKEN_URL: "http://consumer-identityhub:7086/api/sts/token"
+      EDC_IAM_STS_OAUTH_CLIENT_ID: "did:web:consumer-identityhub:7083"
+    depends_on:
+      consumer-identityhub:
+        condition: service_healthy
+      postgres-consumer:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Provider Identity Hub
+  provider-identityhub:
+    build:
+      context: .
+      dockerfile: launchers/identity-hub/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/identity-hub/build/libs/identity-hub.jar
+    container_name: mvd-provider-identityhub
+    ports:
+      - "7093:7093"
+      - "7096:7096"
+    environment:
+      WEB_HTTP_PORT: "7093"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_IDENTITY_PORT: "7093"
+      WEB_HTTP_IDENTITY_PATH: "/api/identity"
+      WEB_HTTP_RESOLUTION_PORT: "7093"
+      WEB_HTTP_RESOLUTION_PATH: "/api/resolution"
+      WEB_HTTP_STS_PORT: "7096"
+      WEB_HTTP_STS_PATH: "/api/sts"
+      EDC_PARTICIPANT_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-provider:5432/provider"
+      EDC_DATASOURCE_DEFAULT_USER: "provider"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "provider"
+    depends_on:
+      postgres-provider:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      issuer-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7093/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Provider Connector - QnA
+  provider-connector-qna:
+    build:
+      context: .
+      dockerfile: launchers/controlplane/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/controlplane/build/libs/controlplane.jar
+    container_name: mvd-provider-connector-qna
+    ports:
+      - "8190:8190"  # Default API
+      - "8191:8191"  # Management API
+      - "8192:8192"  # DSP Protocol API
+      - "8193:8193"  # Control API
+      - "8194:8194"  # Catalog API
+      - "8195:8195"  # Version API
+      - "12001:12001"  # Data Plane Public API
+    environment:
+      WEB_HTTP_PORT: "8190"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_MANAGEMENT_PORT: "8191"
+      WEB_HTTP_MANAGEMENT_PATH: "/api/management/"
+      WEB_HTTP_MANAGEMENT_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_MANAGEMENT_AUTH_KEY: "password"
+      WEB_HTTP_PROTOCOL_PORT: "8192"
+      WEB_HTTP_PROTOCOL_PATH: "/api/dsp"
+      WEB_HTTP_CONTROL_PORT: "8193"
+      WEB_HTTP_CONTROL_PATH: "/api/control"
+      WEB_HTTP_CATALOG_PORT: "8194"
+      WEB_HTTP_CATALOG_PATH: "/api/catalog"
+      WEB_HTTP_CATALOG_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_CATALOG_AUTH_KEY: "password"
+      WEB_HTTP_VERSION_PORT: "8195"
+      WEB_HTTP_VERSION_PATH: "/api/version"
+      WEB_HTTP_PUBLIC_PORT: "12001"
+      WEB_HTTP_PUBLIC_PATH: "/api/public"
+      EDC_PARTICIPANT_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_ISSUER_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_DSP_CALLBACK_ADDRESS: "http://provider-connector-qna:8192/api/dsp"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-provider:5432/provider"
+      EDC_DATASOURCE_DEFAULT_USER: "provider"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "provider"
+      EDC_IAM_STS_OAUTH_TOKEN_URL: "http://provider-identityhub:7096/api/sts/token"
+      EDC_IAM_STS_OAUTH_CLIENT_ID: "did:web:provider-identityhub:7093"
+      EDC_RUNTIME_ID: "provider-qna-runtime"
+    depends_on:
+      provider-identityhub:
+        condition: service_healthy
+      postgres-provider:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8190/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Provider Connector - Manufacturing
+  provider-connector-manufacturing:
+    build:
+      context: .
+      dockerfile: launchers/controlplane/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/controlplane/build/libs/controlplane.jar
+    container_name: mvd-provider-connector-manufacturing
+    ports:
+      - "8290:8290"  # Default API
+      - "8291:8291"  # Management API
+      - "8292:8292"  # DSP Protocol API
+      - "8293:8293"  # Control API
+      - "8294:8294"  # Catalog API
+      - "8295:8295"  # Version API
+      - "12002:12002"  # Data Plane Public API
+    environment:
+      WEB_HTTP_PORT: "8290"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_MANAGEMENT_PORT: "8291"
+      WEB_HTTP_MANAGEMENT_PATH: "/api/management/"
+      WEB_HTTP_MANAGEMENT_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_MANAGEMENT_AUTH_KEY: "password"
+      WEB_HTTP_PROTOCOL_PORT: "8292"
+      WEB_HTTP_PROTOCOL_PATH: "/api/dsp"
+      WEB_HTTP_CONTROL_PORT: "8293"
+      WEB_HTTP_CONTROL_PATH: "/api/control"
+      WEB_HTTP_CATALOG_PORT: "8294"
+      WEB_HTTP_CATALOG_PATH: "/api/catalog"
+      WEB_HTTP_CATALOG_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_CATALOG_AUTH_KEY: "password"
+      WEB_HTTP_VERSION_PORT: "8295"
+      WEB_HTTP_VERSION_PATH: "/api/version"
+      WEB_HTTP_PUBLIC_PORT: "12002"
+      WEB_HTTP_PUBLIC_PATH: "/api/public"
+      EDC_PARTICIPANT_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_ISSUER_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_DSP_CALLBACK_ADDRESS: "http://provider-connector-manufacturing:8292/api/dsp"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-provider:5432/provider"
+      EDC_DATASOURCE_DEFAULT_USER: "provider"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "provider"
+      EDC_IAM_STS_OAUTH_TOKEN_URL: "http://provider-identityhub:7096/api/sts/token"
+      EDC_IAM_STS_OAUTH_CLIENT_ID: "did:web:provider-identityhub:7093"
+      EDC_RUNTIME_ID: "provider-manufacturing-runtime"
+    depends_on:
+      provider-identityhub:
+        condition: service_healthy
+      postgres-provider:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8290/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Provider Catalog Server
+  provider-catalogserver:
+    build:
+      context: .
+      dockerfile: launchers/catalog-server/src/main/docker/Dockerfile
+      args:
+        JAR: launchers/catalog-server/build/libs/catalog-server.jar
+    container_name: mvd-provider-catalogserver
+    ports:
+      - "8180:8180"  # Default API
+      - "8181:8181"  # Management API
+      - "8182:8182"  # DSP Protocol API
+      - "8184:8184"  # Catalog API
+      - "8185:8185"  # Version API
+    environment:
+      WEB_HTTP_PORT: "8180"
+      WEB_HTTP_PATH: "/api"
+      WEB_HTTP_MANAGEMENT_PORT: "8181"
+      WEB_HTTP_MANAGEMENT_PATH: "/api/management/"
+      WEB_HTTP_MANAGEMENT_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_MANAGEMENT_AUTH_KEY: "password"
+      WEB_HTTP_PROTOCOL_PORT: "8182"
+      WEB_HTTP_PROTOCOL_PATH: "/api/dsp"
+      WEB_HTTP_CATALOG_PORT: "8184"
+      WEB_HTTP_CATALOG_PATH: "/api/catalog"
+      WEB_HTTP_CATALOG_AUTH_TYPE: "tokenbased"
+      WEB_HTTP_CATALOG_AUTH_KEY: "password"
+      WEB_HTTP_VERSION_PORT: "8185"
+      WEB_HTTP_VERSION_PATH: "/api/version"
+      EDC_PARTICIPANT_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_ISSUER_ID: "did:web:provider-identityhub:7093"
+      EDC_IAM_DID_WEB_USE_HTTPS: "false"
+      EDC_DSP_CALLBACK_ADDRESS: "http://provider-catalogserver:8182/api/dsp"
+      EDC_VAULT_HASHICORP_URL: "http://vault:8200"
+      EDC_VAULT_HASHICORP_TOKEN: "root"
+      EDC_DATASOURCE_DEFAULT_URL: "jdbc:postgresql://postgres-provider:5432/provider"
+      EDC_DATASOURCE_DEFAULT_USER: "provider"
+      EDC_DATASOURCE_DEFAULT_PASSWORD: "provider"
+      EDC_IAM_STS_OAUTH_TOKEN_URL: "http://provider-identityhub:7096/api/sts/token"
+      EDC_IAM_STS_OAUTH_CLIENT_ID: "did:web:provider-identityhub:7093"
+      EDC_RUNTIME_ID: "provider-catalogserver-runtime"
+    depends_on:
+      provider-identityhub:
+        condition: service_healthy
+      postgres-provider:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8180/api/check/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-consumer-data:
+  postgres-provider-data:
+  postgres-issuer-data:
+
+networks:
+  default:
+    name: mvd-network
